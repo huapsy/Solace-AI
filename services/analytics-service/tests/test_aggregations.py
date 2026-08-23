@@ -213,18 +213,38 @@ class TestAnalyticsAggregator:
         assert summary.get("session.started") == 1
 
     @pytest.mark.asyncio
-    async def test_track_safety_event(self, analytics_aggregator):
-        """Test tracking safety events."""
-        await analytics_aggregator.track_safety_event(
-            risk_level="HIGH",
-            detection_layer=2,
-            metadata={"recommended_action": "escalate"},
-        )
+    async def test_track_safety_assessment(self, analytics_aggregator):
+        """Test tracking a completed safety assessment (safety.assessment.completed)."""
+        await analytics_aggregator.track_safety_assessment(risk_level="LOW", detection_layer=1)
 
         metrics = await analytics_aggregator.store.get_aggregated(
-            "safety.crisis_events", window_type=AggregationWindow.MINUTE
+            "safety.assessments", window_type=AggregationWindow.MINUTE
         )
         assert len(metrics) > 0
+
+    @pytest.mark.asyncio
+    async def test_track_crisis_event_records_crisis_only(self, analytics_aggregator):
+        """A detected crisis records safety.crisis_events (escalations are their own event)."""
+        await analytics_aggregator.track_crisis_event(crisis_level="CRITICAL", detection_layer=2)
+
+        crises = await analytics_aggregator.store.get_aggregated(
+            "safety.crisis_events", window_type=AggregationWindow.MINUTE
+        )
+        escalations = await analytics_aggregator.store.get_aggregated(
+            "safety.escalations", window_type=AggregationWindow.MINUTE
+        )
+        assert len(crises) > 0
+        assert len(escalations) == 0
+
+    @pytest.mark.asyncio
+    async def test_track_escalation_records_escalation(self, analytics_aggregator):
+        """A triggered escalation (safety.escalation.triggered) records safety.escalations."""
+        await analytics_aggregator.track_escalation(priority="high", crisis_level="CRITICAL")
+
+        escalations = await analytics_aggregator.store.get_aggregated(
+            "safety.escalations", window_type=AggregationWindow.MINUTE
+        )
+        assert len(escalations) > 0
 
     @pytest.mark.asyncio
     async def test_track_therapy_event(self, analytics_aggregator):

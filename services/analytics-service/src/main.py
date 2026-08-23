@@ -208,6 +208,13 @@ async def lifespan(app: FastAPI):
 
     settings = AnalyticsServiceSettings.load()
 
+    # REV-32: fail loud at startup if this service's resolved environment disagrees with the
+    # deployment's bare ENVIRONMENT (a misnamed/unset ANALYTICS_SERVICE_ENV would silently pin
+    # the service to the development default, disabling the production fail-loud guards).
+    # Also runs the broader production-secret validation (self-skips outside prod/staging).
+    from solace_security.production_guards import ProductionGuards
+    ProductionGuards.assert_startup(settings.service.env, service_name="analytics-service")
+
     # Configure structured logging with PHI sanitizer
     try:
         from solace_security.phi_protection import phi_sanitizer_processor
@@ -245,6 +252,11 @@ async def lifespan(app: FastAPI):
         kafka_enabled=settings.consumer.kafka_enabled,
     )
 
+    # REV-12: PHI-encryption exemption (documented). This service persists no
+    # ClinicalBase entities — analytics events live in ClickHouse (not SQLAlchemy).
+    # configure_phi_encryption() only affects ClinicalBase, so it is intentionally
+    # NOT configured here (least privilege: no PHI master key). Enforced by
+    # tests/integration/test_phi_encryption_activation.py.
     _analytics_aggregator, _report_service, _analytics_consumer = _create_services(settings)
 
     try:

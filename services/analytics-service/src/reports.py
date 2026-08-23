@@ -524,20 +524,24 @@ class ComplianceAuditReportGenerator(ReportGenerator):
         """Generate compliance audit report."""
         store = aggregator.store
 
+        # A-1b: query the metric names the aggregator actually records — assessments
+        # from safety.assessment.completed, crises + escalations from safety.crisis.detected
+        # (track_safety_assessment / track_crisis_event) — not phantom "events.safety.*"
+        # names that nothing wrote.
         safety_checks = await store.get_aggregated(
-            "events.safety.assessment.completed",
+            "safety.assessments",
             window_type=AggregationWindow.DAY,
             start_time=time_range.start,
             end_time=time_range.end,
         )
         crisis_events = await store.get_aggregated(
-            "events.safety.crisis.detected",
+            "safety.crisis_events",
             window_type=AggregationWindow.DAY,
             start_time=time_range.start,
             end_time=time_range.end,
         )
         escalations = await store.get_aggregated(
-            "events.safety.escalation.triggered",
+            "safety.escalations",
             window_type=AggregationWindow.DAY,
             start_time=time_range.start,
             end_time=time_range.end,
@@ -578,8 +582,15 @@ class ComplianceAuditReportGenerator(ReportGenerator):
             data={
                 "safety_check_coverage": f"{min(100, total_checks / max(1, total_crises) * 100):.0f}%",
                 "escalation_protocol_adherence": f"{escalation_rate * 100:.1f}%",
-                "data_retention_compliant": True,
-                "audit_log_integrity": True,
+                # A-1 (HIPAA): analytics cannot itself verify retention or audit-chain
+                # integrity — hardcoding True falsely asserted compliance on a
+                # compliance report. Report honestly as not-self-assessed; these must
+                # be verified by the retention job and the audit service's
+                # verify_chain respectively (wired at Phase C).
+                "data_retention_compliant": "not_assessed",
+                "audit_log_integrity": "not_assessed",
+                "_note": "retention + audit-chain integrity are verified externally "
+                         "(retention job / audit service), not by analytics.",
             },
         )
 

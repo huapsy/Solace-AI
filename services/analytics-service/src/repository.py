@@ -20,6 +20,23 @@ logger = structlog.get_logger(__name__)
 
 _NIL_UUID = UUID(int=0)
 
+# REV-17 (GDPR Art. 17 right-to-erasure): the analytics tables that carry a
+# per-user ``user_id`` column and therefore hold rows that MUST be removed when a
+# user exercises their right to erasure.
+#
+# Only ``analytics_events`` is user-tagged. ``analytics_metrics`` and
+# ``analytics_aggregations`` store ANONYMOUS aggregate counters/gauges (counts,
+# sums, min/max/avg) labelled by non-user dimensions (event_type, risk_level,
+# modality, ...) — verified in models.py (MetricRecord/AggregationRecord have no
+# user_id field), consumer.py and aggregations.py (user_id is never written into
+# a metric/aggregation label). They are therefore NOT personal data under GDPR
+# Art. 17. Issuing ``ALTER TABLE analytics_metrics DELETE WHERE user_id = ...``
+# would (a) error with "missing column user_id" — turning every erasure into a
+# permanent failure — and (b) if it did match, destroy aggregate rows shared
+# across ALL users (over-reach). Both are forbidden by the erasure contract, so
+# they are intentionally excluded.
+USER_TAGGED_TABLES: tuple[str, ...] = (TableName.EVENTS.value,)
+
 
 def _safe_uuid(value: Any, field_name: str = "unknown") -> UUID:
     """Parse UUID safely, returning nil UUID on failure."""
@@ -90,6 +107,8 @@ class AnalyticsRepository(ABC):
     ) -> list[AggregationRecord]: ...
     @abstractmethod
     async def store_aggregation(self, aggregation: AggregationRecord) -> None: ...
+    @abstractmethod
+    async def delete_user_data(self, user_id: UUID | str) -> int: ...
 
 
 class ClickHouseRepository(AnalyticsRepository):
@@ -289,6 +308,51 @@ class ClickHouseRepository(AnalyticsRepository):
             logger.error("aggregation_store_failed", error=str(e))
             raise QueryError(f"Failed to store aggregation: {e}")
 
+    async def delete_user_data(self, user_id: UUID | str) -> int:
+        """REV-17 GDPR right-to-erasure: delete ALL of one user's rows.
+
+        Issues one ``ALTER TABLE <t> DELETE WHERE user_id = %(user_id)s`` mutation
+        per user-tagged table (see :data:`USER_TAGGED_TABLES` — currently only
+        ``analytics_events``). Returns the number of rows removed, counted with a
+        ``SELECT count()`` immediately before each mutation, since ClickHouse
+        ``ALTER ... DELETE`` mutations run asynchronously and do not return an
+        affected-row count.
+
+        ``user_id`` is always bound as a server-side ``%(user_id)s`` parameter
+        (never string-formatted into the statement) so the delete is
+        injection-safe, matching the parameter style used by the query methods.
+        """
+        if not self._connected:
+            raise RepositoryConnectionError("Not connected to ClickHouse")
+        uid = str(user_id)
+        params = {"user_id": uid}
+        total = 0
+        try:
+            for table in USER_TAGGED_TABLES:
+                count_result = await asyncio.to_thread(
+                    self._client.query,
+                    f"SELECT count() FROM {table} WHERE user_id = %(user_id)s",
+                    parameters=params,
+                )
+                rows = getattr(count_result, "result_rows", None) or []
+                matched = int(rows[0][0]) if rows and rows[0] else 0
+                # ``mutations_sync = 2`` blocks until the DELETE mutation has
+                # MATERIALIZED on all replicas before returning, so a GDPR
+                # completion is attested only after the rows are actually gone
+                # (ClickHouse mutations are asynchronous by default).
+                await asyncio.to_thread(
+                    self._client.command,
+                    f"ALTER TABLE {table} DELETE WHERE user_id = %(user_id)s "
+                    "SETTINGS mutations_sync = 2",
+                    parameters=params,
+                )
+                logger.info("clickhouse_user_data_deleted", table=table, user_id=uid, rows=matched)
+                total += matched
+            return total
+        except Exception as e:
+            logger.error("clickhouse_user_delete_failed", user_id=uid, error=str(e))
+            raise QueryError(f"Failed to delete user data: {e}")
+
 
 class InMemoryRepository(AnalyticsRepository):
     """In-memory implementation for testing and development."""
@@ -357,6 +421,24 @@ class InMemoryRepository(AnalyticsRepository):
     async def store_aggregation(self, aggregation: AggregationRecord) -> None:
         async with self._lock:
             self._aggregations.append(aggregation)
+
+    async def delete_user_data(self, user_id: UUID | str) -> int:
+        """REV-17 GDPR right-to-erasure: remove ALL of one user's rows.
+
+        Mirrors the ClickHouse deleter's contract for unit-testing: only the
+        user-tagged store (events) holds per-user rows. Metrics and aggregations
+        carry no user_id (anonymous aggregates), so they are intentionally left
+        untouched — deleting them would corrupt other users' aggregate counters.
+        Returns the number of event rows removed; idempotent (a second call for
+        the same user removes 0).
+        """
+        uid = str(user_id)
+        async with self._lock:
+            before = len(self._events)
+            self._events = [e for e in self._events if str(e.user_id) != uid]
+            removed = before - len(self._events)
+        logger.info("inmemory_user_data_deleted", user_id=uid, rows=removed)
+        return removed
 
 
 _repository_instance: AnalyticsRepository | None = None

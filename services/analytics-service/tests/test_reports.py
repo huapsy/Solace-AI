@@ -182,11 +182,7 @@ class TestSafetyOverviewReportGenerator:
     @pytest.mark.asyncio
     async def test_generate_report(self, generator, analytics_aggregator, time_range_last_hour):
         """Test generating safety overview report."""
-        await analytics_aggregator.track_safety_event(
-            risk_level="LOW",
-            detection_layer=1,
-            metadata={},
-        )
+        await analytics_aggregator.track_safety_assessment(risk_level="LOW", detection_layer=1)
 
         report = await generator.generate(analytics_aggregator, time_range_last_hour)
 
@@ -275,11 +271,7 @@ class TestReportService:
     @pytest.mark.asyncio
     async def test_generate_safety_report(self, report_service, analytics_aggregator):
         """Test generating a safety overview report."""
-        await analytics_aggregator.track_safety_event(
-            risk_level="LOW",
-            detection_layer=1,
-            metadata={},
-        )
+        await analytics_aggregator.track_safety_assessment(risk_level="LOW", detection_layer=1)
 
         report = await report_service.generate_report(ReportType.SAFETY_OVERVIEW)
 
