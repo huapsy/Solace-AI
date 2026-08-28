@@ -1,0 +1,2 @@
+# Diagnosis Service — service-specific deps (installed on top of ../../requirements-runtime.txt).
+# Diagnosis needs nothing beyond the shared runtime base; heavy ML lives in requirements-ml.txt.

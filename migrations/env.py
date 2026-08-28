@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from logging.config import fileConfig
 
 from alembic import context
@@ -12,6 +13,16 @@ from sqlalchemy.ext.asyncio import async_engine_from_config
 from src.solace_infrastructure.database.base_models import Base
 
 config = context.config
+
+# Honor the DATABASE_URL environment variable when set, overriding the static
+# sqlalchemy.url in alembic.ini. Coerce a plain postgresql:// DSN to the asyncpg
+# driver required by run_async_migrations(). This lets CI/prod point migrations
+# at the real database without editing the ini.
+_db_url = os.environ.get("DATABASE_URL")
+if _db_url:
+    if _db_url.startswith("postgresql://"):
+        _db_url = _db_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+    config.set_main_option("sqlalchemy.url", _db_url)
 
 if config.config_file_name is not None:
     fileConfig(config.config_file_name)

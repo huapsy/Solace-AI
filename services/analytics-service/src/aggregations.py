@@ -37,6 +37,17 @@ class AggregationWindow(str, Enum):
     MONTH = "month"
 
 
+# Coarseness ordering: a query at a coarser window can roll up finer stored buckets,
+# but a coarse stored bucket cannot be split into finer query windows.
+_GRANULARITY_RANK: dict["AggregationWindow", int] = {
+    AggregationWindow.MINUTE: 0,
+    AggregationWindow.HOUR: 1,
+    AggregationWindow.DAY: 2,
+    AggregationWindow.WEEK: 3,
+    AggregationWindow.MONTH: 4,
+}
+
+
 class MetricType(str, Enum):
     """Types of metrics tracked."""
     COUNTER = "counter"
@@ -136,6 +147,51 @@ class MetricBucket:
         return AggregatedMetric(
             metric_name=self.metric_name,
             window=self.window.window_type,
+            window_start=self.window.start,
+            window_end=self.window.end,
+            count=self.count,
+            sum_value=self.sum_value,
+            min_value=self.min_value,
+            max_value=self.max_value,
+            avg_value=self.sum_value / Decimal(self.count) if self.count > 0 else None,
+            labels=self.labels,
+        )
+
+
+@dataclass
+class _RollupAccumulator:
+    """Accumulates finer-grained buckets into a single coarser query window.
+
+    Used by MetricsStore.get_aggregated to answer HOUR/DAY queries from MINUTE
+    buckets while preserving per-label-set breakdowns.
+    """
+    window: TimeWindow
+    labels: dict[str, str]
+    count: int = 0
+    sum_value: Decimal = field(default_factory=lambda: Decimal("0"))
+    min_value: Decimal | None = None
+    max_value: Decimal | None = None
+
+    def merge(self, bucket: MetricBucket) -> None:
+        """Fold one finer-grained bucket into this accumulator."""
+        self.count += bucket.count
+        self.sum_value += bucket.sum_value
+        if bucket.min_value is not None:
+            self.min_value = (
+                bucket.min_value if self.min_value is None
+                else min(self.min_value, bucket.min_value)
+            )
+        if bucket.max_value is not None:
+            self.max_value = (
+                bucket.max_value if self.max_value is None
+                else max(self.max_value, bucket.max_value)
+            )
+
+    def to_aggregated(self, metric_name: str, window_type: AggregationWindow) -> AggregatedMetric:
+        """Materialize the rolled-up window as an immutable AggregatedMetric."""
+        return AggregatedMetric(
+            metric_name=metric_name,
+            window=window_type,
             window_start=self.window.start,
             window_end=self.window.end,
             count=self.count,
@@ -257,24 +313,42 @@ class MetricsStore:
         end_time: datetime | None = None,
         labels: dict[str, str] | None = None,
     ) -> list[AggregatedMetric]:
-        """Get aggregated metrics for a time range."""
+        """Get aggregated metrics for a time range.
+
+        Metrics are recorded into MINUTE buckets by default, but reports query at
+        HOUR/DAY granularity. Rather than drop everything (which previously made all
+        reports read zero), roll finer-grained stored buckets up into the requested
+        window, grouped by (window, labels) so per-label breakdowns survive. Buckets
+        stored coarser than the requested window cannot be split and are skipped.
+        """
         if metric_name not in self._buckets:
             return []
 
-        results: list[AggregatedMetric] = []
         end_time = end_time or datetime.now(timezone.utc)
         start_time = start_time or (end_time - timedelta(hours=24))
+        requested_rank = _GRANULARITY_RANK[window_type]
 
+        rollups: dict[tuple[datetime, str], _RollupAccumulator] = {}
         for bucket in self._buckets[metric_name].values():
-            if bucket.window.window_type != window_type:
-                continue
             if bucket.window.end <= start_time or bucket.window.start >= end_time:
                 continue
             if labels and not self._labels_match(bucket.labels, labels):
                 continue
-            results.append(bucket.to_aggregated())
+            if _GRANULARITY_RANK[bucket.window.window_type] > requested_rank:
+                continue
 
-        return sorted(results, key=lambda m: m.window_start)
+            target = self._create_window(bucket.window.start, window_type)
+            key = (target.start, self._labels_key(bucket.labels))
+            acc = rollups.get(key)
+            if acc is None:
+                acc = _RollupAccumulator(window=target, labels=dict(bucket.labels))
+                rollups[key] = acc
+            acc.merge(bucket)
+
+        return sorted(
+            (acc.to_aggregated(metric_name, window_type) for acc in rollups.values()),
+            key=lambda m: m.window_start,
+        )
 
     async def get_latest(
         self, metric_name: str, labels: dict[str, str] | None = None
@@ -364,17 +438,34 @@ class AnalyticsAggregator:
 
         logger.debug("session_event_tracked", event_type=event_type, user_id=str(user_id))
 
-    async def track_safety_event(
-        self, risk_level: str, detection_layer: int, metadata: dict[str, Any]
-    ) -> None:
-        """Track a safety-related event."""
+    async def track_safety_assessment(self, risk_level: str, detection_layer: int) -> None:
+        """Count one completed safety assessment (canonical: safety.assessment.completed).
+
+        Each metric is counted from its OWN canonical event so a single incident — which
+        emits BOTH an assessment.completed and a crisis.detected — is not double-counted.
+        """
         labels = {"risk_level": risk_level, "detection_layer": str(detection_layer)}
         await self._store.record_counter("safety.assessments", labels=labels)
+        logger.info("safety_assessment_tracked", risk_level=risk_level, detection_layer=detection_layer)
 
-        if risk_level in ("HIGH", "CRITICAL"):
-            await self._store.record_counter("safety.crisis_events", labels=labels)
+    async def track_crisis_event(self, crisis_level: str, detection_layer: int) -> None:
+        """Count one detected crisis (canonical: safety.crisis.detected)."""
+        labels = {"risk_level": crisis_level, "detection_layer": str(detection_layer)}
+        await self._store.record_counter("safety.crisis_events", labels=labels)
+        logger.info("crisis_event_tracked", crisis_level=crisis_level, detection_layer=detection_layer)
 
-        logger.info("safety_event_tracked", risk_level=risk_level, detection_layer=detection_layer)
+    async def track_escalation(self, priority: str = "unknown", crisis_level: str = "NONE") -> None:
+        """Count one triggered escalation (canonical: safety.escalation.triggered).
+
+        This is the AUTHORITATIVE "an escalation was actually triggered" signal — emitted
+        by both auto-escalation (_trigger_auto_escalation -> escalate) and the /escalate
+        endpoint — so the compliance report's escalation_rate reflects real clinician
+        alerts, NOT the crisis event's requires_escalation *recommendation* (which would
+        both under-count direct escalations and over-count when auto-escalation is off).
+        """
+        labels = {"priority": priority, "risk_level": crisis_level}
+        await self._store.record_counter("safety.escalations", labels=labels)
+        logger.info("escalation_tracked", priority=priority, crisis_level=crisis_level)
 
     async def track_therapy_event(
         self, modality: str, technique: str, engagement_score: Decimal | None

@@ -267,18 +267,39 @@ class AnalyticsEventProcessor:
         )
 
     async def _handle_safety_event(self, event: AnalyticsEvent) -> None:
-        """Handle safety-related events."""
-        risk_level = event.payload.get("risk_level") or event.payload.get("crisis_level", "NONE")
-        detection_layer = event.payload.get("detection_layer", 1)
-        metadata = {
-            "risk_score": event.payload.get("risk_score"),
-            "recommended_action": event.payload.get("recommended_action"),
-        }
-        await self._aggregator.track_safety_event(
-            risk_level=str(risk_level),
-            detection_layer=int(detection_layer),
-            metadata=metadata,
-        )
+        """Route safety events to per-metric counters by canonical event type.
+
+        Each safety metric is counted from exactly ONE canonical event so a single
+        incident (which emits BOTH assessment.completed AND crisis.detected) is not
+        double-counted, and every safety.* event is not miscounted as an assessment:
+          safety.assessments  <- safety.assessment.completed
+          safety.crisis_events <- safety.crisis.detected
+          safety.escalations   <- safety.escalation.triggered (the authoritative "an
+                                   escalation was actually triggered" event, emitted by
+                                   both auto-escalation and the /escalate endpoint)
+        """
+        payload = event.payload
+        try:
+            detection_layer = int(payload.get("detection_layer", 1) or 1)
+        except (TypeError, ValueError):
+            detection_layer = 1
+
+        if event.event_type == "safety.crisis.detected":
+            crisis_level = str(payload.get("crisis_level") or payload.get("risk_level") or "NONE")
+            await self._aggregator.track_crisis_event(crisis_level, detection_layer)
+        elif event.event_type == "safety.escalation.triggered":
+            await self._aggregator.track_escalation(
+                priority=str(payload.get("priority", "unknown")),
+                crisis_level=str(payload.get("crisis_level", "NONE")),
+            )
+        elif event.event_type == "safety.assessment.completed":
+            risk_level = str(payload.get("risk_level") or payload.get("crisis_level") or "NONE")
+            await self._aggregator.track_safety_assessment(risk_level, detection_layer)
+        else:
+            # Other safety.* events (crisis.resolved, incident.*, plan.*,
+            # risk.level_changed, ...) are not clinical counters here — ignore them so
+            # they don't inflate the assessment count.
+            logger.debug("safety_event_not_counted", event_type=event.event_type)
 
     async def _handle_therapy_event(self, event: AnalyticsEvent) -> None:
         """Handle therapy-related events."""

@@ -53,9 +53,20 @@ def configure_logging(log_level: str) -> None:
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Application lifespan manager for startup/shutdown."""
     settings = ConfigServiceSettings()
+    # REV-32: fail loud at startup if this service's resolved environment disagrees with the
+    # deployment's bare ENVIRONMENT (a misnamed/unset CONFIG_ENVIRONMENT would silently pin
+    # the service to the development default, disabling the production fail-loud guards).
+    # Also runs the broader production-secret validation (self-skips outside prod/staging).
+    from solace_security.production_guards import ProductionGuards
+    ProductionGuards.assert_startup(settings.environment.value, service_name="config-service")
     configure_logging(settings.log_level)
     logger.info("config_service_starting", environment=settings.environment.value,
                 host=settings.host, port=settings.port)
+    # REV-12: PHI-encryption exemption (documented). This service persists no
+    # ClinicalBase entities or PHI — it manages system configuration, feature
+    # flags and secret references only. configure_phi_encryption() only affects
+    # ClinicalBase, so it is intentionally NOT configured here (least privilege:
+    # no PHI master key). Enforced by tests/integration/test_phi_encryption_activation.py.
     config_manager = await initialize_config(settings)
     flag_manager = await initialize_feature_flags(FeatureFlagSettings())
     app.state.config_manager = config_manager

@@ -258,6 +258,7 @@ async def challenge_hypothesis(
     result = await diagnosis_service.challenge_hypothesis(
         session_id=session_id,
         hypothesis_id=hypothesis_id,
+        user_id=current_user.user_id,
     )
     return {
         "session_id": str(session_id),
@@ -272,8 +273,13 @@ async def challenge_hypothesis(
 @router.get("/status", response_model=dict[str, Any], status_code=status.HTTP_200_OK)
 async def get_service_status(
     diagnosis_service: DiagnosisService = Depends(get_diagnosis_service),
+    _service: AuthenticatedService = Depends(get_current_service),
 ) -> dict[str, Any]:
-    """Get diagnosis service status and statistics."""
+    """Get diagnosis service status and statistics.
+
+    REV-09: gated behind service auth so operational internals are not exposed
+    to unauthenticated callers.
+    """
     return await diagnosis_service.get_status()
 
 
