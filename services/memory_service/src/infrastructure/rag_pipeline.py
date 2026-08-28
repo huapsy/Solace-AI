@@ -20,6 +20,7 @@ class RAGSettings(BaseSettings):
     """RAG pipeline configuration."""
     max_retrieval_attempts: int = Field(default=3)
     min_relevance_score: float = Field(default=0.6)
+    min_relevant_documents: int = Field(default=3)
     max_documents: int = Field(default=10)
     enable_grading: bool = Field(default=True)
     enable_rephrasing: bool = Field(default=True)
@@ -35,6 +36,7 @@ class RetrievalStatus(str, Enum):
     PARTIAL = "partial"
     FAILED = "failed"
     REPHRASED = "rephrased"
+    INSUFFICIENT_CONTEXT = "insufficient_context"
 
 
 class DocumentGrade(str, Enum):
@@ -228,7 +230,9 @@ class RAGPipeline:
                 break
             graded_docs = await self._grade_documents(query, documents)
             relevant_docs = [d for d in graded_docs if d.grade != DocumentGrade.NOT_RELEVANT]
-            if relevant_docs:
+            # Documented corrective-RAG gate: only report SUCCESS when at least the
+            # configured minimum number of RELEVANT documents were retrieved.
+            if len(relevant_docs) >= self._settings.min_relevant_documents:
                 context.documents = self._rerank_and_select(relevant_docs)
                 context.status = RetrievalStatus.SUCCESS
                 self._stats["successes"] += 1
@@ -239,9 +243,14 @@ class RAGPipeline:
                 self._stats["rephrasals"] += 1
                 context.status = RetrievalStatus.REPHRASED
             else:
-                context.documents = graded_docs[:self._settings.rerank_top_k]
-                context.status = RetrievalStatus.PARTIAL
-        if not context.documents:
+                # Correction exhausted with fewer than the minimum relevant docs:
+                # surface the structured "insufficient context" (degraded) result and
+                # carry only the relevant subset found (never NOT_RELEVANT filler).
+                context.documents = self._rerank_and_select(relevant_docs)
+                context.status = RetrievalStatus.INSUFFICIENT_CONTEXT
+                self._stats["failures"] += 1
+                break
+        if not context.documents and context.status != RetrievalStatus.INSUFFICIENT_CONTEXT:
             context.status = RetrievalStatus.FAILED
             self._stats["failures"] += 1
         context.assembled_context = self._assemble_context(context.documents)

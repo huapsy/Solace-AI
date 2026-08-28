@@ -27,6 +27,7 @@ from sqlalchemy import (
     Table,
     Text,
     and_,
+    case,
     delete,
     func,
     insert,
@@ -36,6 +37,11 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import UUID as PG_UUID
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import NullPool
+
+from ..domain.decay_manager import (
+    NEVER_DECAY_CATEGORIES,
+    category_decay_rates,
+)
 
 logger = structlog.get_logger(__name__)
 
@@ -168,8 +174,28 @@ class PostgresRepository:
 
     @asynccontextmanager
     async def session(self) -> AsyncIterator[AsyncSession]:
-        """Provide a transactional session scope."""
+        """Provide a transactional session scope.
+
+        C.2 RLS (Phase C P1-2 / P2-6): this repo owns its SQLAlchemy engine rather
+        than the shared PostgresClient, so it must set the per-request
+        ``app.current_user_id`` GUC on its OWN connection or RLS-protected memory
+        tables would be filtered to nothing (reads) / rejected (writes) — and an
+        admin-triggered GDPR erase would silently delete nothing while attesting
+        complete. Set it transaction-locally from the request context (auto-cleared
+        on commit/rollback, so it can never leak across pooled connections).
+        """
+        from sqlalchemy import text as _sql_text
+
+        from solace_common.request_context import get_current_user_id
+
         async with self._session_factory() as session:
+            _rls_uid = get_current_user_id()
+            if _rls_uid:
+                # is_local=true -> scoped to THIS transaction; no pooled-conn leak.
+                await session.execute(
+                    _sql_text("SELECT set_config('app.current_user_id', :uid, true)"),
+                    {"uid": str(_rls_uid)},
+                )
             try:
                 yield session
                 await session.commit()
@@ -368,26 +394,48 @@ class PostgresRepository:
                                   exclude_permanent: bool = True) -> int:
         """Apply exponential decay to all user records in batch.
 
-        Uses Ebbinghaus formula: retention = retention_strength * exp(-rate * hours_since_last_access)
-        where rate is the decay_factor per hour.
+        Uses the Ebbinghaus formula
+            retention = retention_strength * exp(-rate * days_since_last_access)
+        where ``rate`` is resolved PER CATEGORY from the same canonical table the
+        in-process DecayManager uses (A4): short_term 0.15, medium_term 0.05,
+        long_term 0.02 per day. Permanent/clinical/diagnosis categories carry a
+        rate of 0 (never decay -- REV-29) and, when ``exclude_permanent`` is set,
+        are also filtered out of the update entirely. ``decay_factor`` is retained
+        for backward compatibility and used only as the fallback rate for any
+        unrecognized category (matching DecayManager's medium-term default).
         """
         self._stats["updates"] += 1
+        rates = category_decay_rates()
         async with self.session() as session:
             conditions = [
                 memory_records.c.user_id == user_id,
                 memory_records.c.is_archived == False,
             ]
             if exclude_permanent:
-                conditions.append(memory_records.c.retention_category != "permanent")
-            # Exponential decay based on hours since last access/update
-            hours_elapsed = func.extract(
+                conditions.append(
+                    memory_records.c.retention_category.notin_(
+                        sorted(NEVER_DECAY_CATEGORIES)
+                    )
+                )
+            # Per-category per-day rate, keyed off retention_category. Never-decay
+            # categories map to 0 so they are inert even if not excluded above.
+            rate_expr = case(
+                *[
+                    (memory_records.c.retention_category == category, float(rate))
+                    for category, rate in rates.items()
+                ],
+                else_=float(decay_factor),
+            )
+            # Exponential decay based on days since last access (falls back to
+            # created_at only when a record has never been accessed).
+            days_elapsed = func.extract(
                 "epoch",
                 func.now() - func.coalesce(memory_records.c.accessed_at, memory_records.c.created_at),
-            ) / 3600.0
+            ) / 86400.0
             stmt = update(memory_records).where(and_(*conditions)).values(
                 retention_strength=func.greatest(
                     Decimal("0.0"),
-                    memory_records.c.retention_strength * func.exp(-decay_factor * hours_elapsed),
+                    memory_records.c.retention_strength * func.exp(-rate_expr * days_elapsed),
                 )
             )
             result = await session.execute(stmt)

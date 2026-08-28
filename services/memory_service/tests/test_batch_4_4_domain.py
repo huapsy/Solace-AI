@@ -190,7 +190,7 @@ class TestRetentionPolicy:
 
     def test_calculate_decay(self) -> None:
         policy = RetentionPolicy.medium_term()
-        new_strength = policy.calculate_decay(Decimal("1.0"), hours_elapsed=10)
+        new_strength = policy.calculate_decay(Decimal("1.0"), days_elapsed=10)
         assert new_strength < Decimal("1.0")
 
     def test_get_action_archive(self) -> None:

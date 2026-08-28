@@ -19,6 +19,7 @@ from .models import (
     SessionStartResult, SessionEndResult, AddMessageResult,
     ConsolidationResult, UserProfileResult,
 )
+from .erasure import build_user_data_erasure
 from services.shared import ServiceBase
 
 if TYPE_CHECKING:
@@ -543,34 +544,48 @@ class MemoryService(ServiceBase):
         )
 
     async def delete_user_data(self, user_id: UUID) -> None:
-        """Delete all user data (GDPR compliance).
+        """Delete all user data (GDPR right-to-erasure, REV-17).
 
-        Raises on persistent-storage failure so that callers know the deletion
-        was incomplete.  In-memory caches are only cleared **after** all
-        persistent stores have been purged successfully.
+        Routes every persistent store the service owns — Postgres, Weaviate AND
+        Redis — through the shared, fail-loud ``UserDataErasure`` orchestrator:
+        ALL registered stores are attempted, and if ANY fails an
+        ``ErasureIncomplete`` is raised so a partial erasure is NEVER reported
+        complete. In-memory tier caches are cleared only **after** the durable
+        stores have been fully purged. Preserves the existing contract (returns
+        ``None``; the DELETE endpoint maps that to HTTP 204).
         """
-        # 1. Delete from persistent stores — propagate failures
-        if self._postgres_repo:
-            counts = await self._postgres_repo.delete_user_data(user_id)
-            logger.info(
-                "user_data_deleted_postgres",
-                user_id=str(user_id),
-                records=counts[0],
-                summaries=counts[1],
-                facts=counts[2],
-                events=counts[3],
+        # 1. Delete from all durable stores under the fail-loud contract. Wiring
+        #    Redis in here (previously never called) is part of REV-17.
+        erasure = build_user_data_erasure(
+            postgres_repo=self._postgres_repo,
+            weaviate_repo=self._weaviate_repo,
+            redis_cache=self._redis,
+        )
+        if erasure.store_names:
+            # P1-2 (Phase C gate) / C.2 RLS: the memory Postgres tables are
+            # RLS-protected (migration 006). The erase endpoint authenticates the
+            # CALLER, so the request GUC (app.current_user_id) is the caller's id.
+            # For an admin erasing ANOTHER user that would RLS-filter every DELETE
+            # to the admin's own rows and silently erase nothing while attesting
+            # complete. Scope the GUC to the TARGET user for the duration of the
+            # erase (so RLS admits the target's rows), then restore the caller's
+            # context in finally.
+            from solace_common.request_context import (
+                reset_current_user_id,
+                set_current_user_id,
             )
-
-        # 2. Delete vector data from Weaviate
-        if self._weaviate_repo:
+            token = set_current_user_id(str(user_id))
             try:
-                await self._weaviate_repo.delete_user_data(user_id)
-                logger.info("user_data_deleted_weaviate", user_id=str(user_id))
-            except Exception:
-                logger.exception("weaviate_delete_user_data_failed", user_id=str(user_id))
-                raise
+                await erasure.erase(
+                    str(user_id),
+                    audit_emit=lambda report: logger.info(
+                        "gdpr_erasure_complete", **report.to_dict()
+                    ),
+                )
+            finally:
+                reset_current_user_id(token)
 
-        # 3. Only clear in-memory caches after persistent deletes succeed
+        # 2. Only clear in-memory caches after persistent deletes succeed.
         self._tier_1_input.pop(user_id, None)
         self._tier_2_working.pop(user_id, None)
         self._tier_3_session.pop(user_id, None)
@@ -765,7 +780,7 @@ class MemoryService(ServiceBase):
                 # Only permanent memories are exempt; long_term decays at 0.02
                 if record.retention_category == "permanent":
                     continue
-                elapsed_hours = (datetime.now(timezone.utc) - record.created_at).total_seconds() / 3600
+                elapsed_days = (datetime.now(timezone.utc) - record.created_at).total_seconds() / 86400
                 if record.retention_category == "long_term":
                     decay_rate = Decimal("0.02")
                 elif record.retention_category == "medium_term":
@@ -777,7 +792,7 @@ class MemoryService(ServiceBase):
                 stability = min(3.0, 1.0 * (1.5 ** access_count))
                 record.retention_strength = max(
                     Decimal("0.1"),
-                    Decimal(str(stability)) * Decimal(str(math.exp(-float(decay_rate) * elapsed_hours))),
+                    Decimal(str(stability)) * Decimal(str(math.exp(-float(decay_rate) * elapsed_days))),
                 )
                 decayed += 1
                 if record.retention_strength < Decimal("0.3"):

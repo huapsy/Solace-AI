@@ -118,10 +118,12 @@ class RetentionPolicy(BaseModel):
         return cls(policy_type=RetentionPolicyType.EPHEMERAL, base_decay_rate=Decimal("0.2"), min_retention_strength=Decimal("0"),
                    archive_threshold=Decimal("0.1"), delete_threshold=Decimal("0.05"), max_age_days=7, boost_on_access=Decimal("0.02"))
 
-    def calculate_decay(self, current_strength: Decimal, hours_elapsed: int, emotional_content: bool = False) -> Decimal:
+    def calculate_decay(self, current_strength: Decimal, days_elapsed: int, emotional_content: bool = False) -> Decimal:
         """Calculate new retention strength after decay using Ebbinghaus model.
 
-        Uses R(t) = e^(-λ*t) * S where λ is the decay rate and S is current strength.
+        Uses R(t) = e^(-λ*t) * S where λ is the per-day decay rate, t is elapsed
+        time in DAYS, and S is current strength. The time unit must be days to match
+        the per-day rates used by DecayManager and the SQL batch decay path.
         """
         import math
         if self.policy_type == RetentionPolicyType.PERMANENT:
@@ -129,7 +131,7 @@ class RetentionPolicy(BaseModel):
         decay_rate = self.base_decay_rate
         if emotional_content:
             decay_rate = decay_rate * self.emotional_decay_modifier
-        new_strength = Decimal(str(math.exp(-float(decay_rate) * hours_elapsed))) * current_strength
+        new_strength = Decimal(str(math.exp(-float(decay_rate) * days_elapsed))) * current_strength
         return max(Decimal("0"), new_strength)
 
     def get_action(self, retention_strength: Decimal) -> str:

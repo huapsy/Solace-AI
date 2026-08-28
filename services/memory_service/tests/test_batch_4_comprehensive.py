@@ -374,13 +374,13 @@ class TestRetentionPolicyComplete:
     def test_calculate_decay_zero_hours(self) -> None:
         """Test calculate_decay with zero hours."""
         policy = RetentionPolicy.medium_term()
-        result = policy.calculate_decay(Decimal("1.0"), hours_elapsed=0)
+        result = policy.calculate_decay(Decimal("1.0"), days_elapsed=0)
         assert result == Decimal("1.0")
 
     def test_calculate_decay_long_duration(self) -> None:
         """Test calculate_decay with very long duration."""
         policy = RetentionPolicy.short_term()
-        result = policy.calculate_decay(Decimal("1.0"), hours_elapsed=8760)  # 1 year
+        result = policy.calculate_decay(Decimal("1.0"), days_elapsed=365)  # 1 year
         assert result >= Decimal("0.0")
 
     def test_get_action_thresholds(self) -> None:

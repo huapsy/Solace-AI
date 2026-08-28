@@ -319,18 +319,38 @@ class WeaviateRepository:
             return False
 
     async def delete_user_data(self, user_id: UUID) -> int:
-        """Delete all vectors for a user (GDPR compliance)."""
+        """Delete all vectors for a user (GDPR right-to-erasure, REV-17).
+
+        Fail-loud: this deleter is registered with the ``UserDataErasure``
+        orchestrator, which treats a returned int as success. A not-initialized
+        client or ANY per-collection ``delete_many`` failure therefore RAISES, so
+        the orchestrator records ``memory_weaviate`` as failed and never attests a
+        complete erasure while a user's vectors may remain. Weaviate holds unique
+        vector data (unlike the Redis cache tier), so a registered-but-unreachable
+        store is a genuine failure, not a benign skip.
+        """
         if not self._initialized:
-            return 0
+            raise RuntimeError(
+                "weaviate repository not initialized; cannot erase user vectors"
+            )
+        from weaviate.classes.query import Filter
         deleted = 0
-        try:
-            from weaviate.classes.query import Filter
-            for coll_name in CollectionName:
+        errors: list[str] = []
+        for coll_name in CollectionName:
+            try:
                 coll = await asyncio.to_thread(self._client.collections.get, coll_name.value)
-                await asyncio.to_thread(coll.data.delete_many, where=Filter.by_property("user_id").equal(str(user_id)))
+                await asyncio.to_thread(
+                    coll.data.delete_many,
+                    where=Filter.by_property("user_id").equal(str(user_id)),
+                )
                 deleted += 1
-        except Exception as e:
-            logger.error("user_delete_failed", error=str(e))
+            except Exception as e:  # noqa: BLE001 - collect, then fail loud below
+                logger.error("user_delete_failed", collection=coll_name.value, error=str(e))
+                errors.append(f"{coll_name.value}: {e}")
+        if errors:
+            raise RuntimeError(
+                "weaviate user erasure incomplete: " + "; ".join(errors)
+            )
         return deleted
 
     async def get_collection_count(self, collection: str, user_id: UUID | None = None) -> int:

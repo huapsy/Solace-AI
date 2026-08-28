@@ -336,24 +336,88 @@ class RedisCache:
             logger.error("session_count_incr_failed", error=str(e))
             return 0
 
+    async def _scan_all(self, pattern: str) -> list[str]:
+        """Return every key matching ``pattern`` (cursor loop to completion)."""
+        keys: list[str] = []
+        cursor = 0
+        while True:
+            cursor, batch = await self._client.scan(cursor, match=pattern, count=100)
+            if batch:
+                keys.extend(batch)
+            if cursor == 0:
+                break
+        return keys
+
     async def delete_user_cache(self, user_id: UUID) -> int:
-        """Delete all cached data for a user."""
+        """Delete ALL cached data for a user (GDPR right-to-erasure, REV-17).
+
+        The old ``solace:memory:*:{uid}:*`` pattern only matched keys carrying the
+        uid as a *middle* segment (``working:{uid}:{sid}``, ``context:{uid}:{ck}``)
+        and silently missed:
+
+          * trailing-uid keys ``user_session:{uid}`` and ``session_count:{uid}``
+            (the uid is the FINAL segment, with no suffix) — now matched by the
+            extra ``solace:memory:*:{uid}`` pass;
+          * session blobs ``session:{sid}`` which carry NO uid in the key at all —
+            resolved from the ``user_session:{uid}`` pointer AND by inspecting the
+            ``user_id`` embedded in each ``session:*`` blob, so orphaned
+            prior-session blobs are purged too.
+
+        The content-addressed ``embedding:{hash}`` cache is keyed by content hash
+        (shared across users), not by user, so it is intentionally left untouched
+        — deleting it would over-reach into other users' cached embeddings.
+        """
         if not self._initialized:
             return 0
-        deleted = 0
+        self._stats["deletes"] += 1
+        uid = str(user_id)
+        to_delete: set[str] = set()
         try:
-            pattern, cursor = self._key("*", str(user_id), "*"), 0
-            while True:
-                cursor, keys = await self._client.scan(cursor, match=pattern, count=100)
-                if keys:
-                    await self._client.delete(*keys)
-                    deleted += len(keys)
-                if cursor == 0:
-                    break
-            logger.info("user_cache_deleted", user_id=str(user_id), deleted=deleted)
+            # 1. uid-scoped keys: middle-uid (working/context) + trailing-uid
+            #    (user_session/session_count).
+            for pattern in (self._key("*", uid, "*"), self._key("*", uid)):
+                to_delete.update(await self._scan_all(pattern))
+
+            # 2. session:{sid} blobs (no uid in the key). Resolve the current
+            #    session from the user_session pointer, then confirm ownership of
+            #    every session blob via its embedded user_id (catches orphans).
+            try:
+                pointer = await self._client.get(self._key("user_session", uid))
+            except Exception:
+                pointer = None
+            if pointer:
+                to_delete.add(self._key("session", str(pointer)))
+            for skey in await self._scan_all(self._key("session", "*")):
+                try:
+                    raw = await self._client.get(skey)
+                except Exception:
+                    continue
+                if not raw:
+                    continue
+                try:
+                    parsed = json.loads(raw)
+                except (ValueError, TypeError):
+                    continue
+                # A non-dict JSON blob (number/string) has no .get — guard with
+                # isinstance so it can't raise AttributeError and abort the whole
+                # purge (which would silently under-delete on the erasure path).
+                if isinstance(parsed, dict) and parsed.get("user_id") == uid:
+                    to_delete.add(skey)
+
+            deleted = 0
+            if to_delete:
+                deleted = await self._client.delete(*to_delete)
+            logger.info("user_cache_deleted", user_id=uid, deleted=deleted)
+            return deleted
         except Exception as e:
+            # Fail-loud: this deleter is registered with the GDPR erasure
+            # orchestrator, so an operational Redis failure mid-purge must RAISE
+            # (recorded as a failed store -> ErasureIncomplete), never be swallowed
+            # into a false "0 keys, complete" attestation. (A wholly-absent Redis is
+            # handled by the not-initialized guard above, since the cache tier's PHI
+            # is also durably erased from Postgres.)
             logger.error("user_cache_delete_failed", error=str(e))
-        return deleted
+            raise
 
     async def health_check(self) -> bool:
         """Check Redis health."""
