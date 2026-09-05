@@ -189,7 +189,11 @@ class TestInMemoryOutboxStore:
             partition_key="key",
         )
         await store.save(record)
-        await store.mark_published(record.id)
+        # mark_published is claim-conditional (P2-8): claim the record (PUBLISHING)
+        # as the real flush flow does, then finalize it.
+        await store.get_pending()
+        marked = await store.mark_published(record.id)
+        assert marked is True
         pending = await store.get_pending()
         assert len(pending) == 0
         assert store._records[record.id].status == OutboxStatus.PUBLISHED
@@ -453,7 +457,12 @@ class TestEventPublisher:
     async def test_flush_outbox_retries_on_failure(self, outbox_store: InMemoryOutboxStore) -> None:
         """Test flush_outbox retries on failure."""
         failing_producer = MockKafkaProducerAdapter()
-        publisher = EventPublisher(failing_producer, outbox_store, max_retries=3)
+        # retry_base_seconds=0 disables the backoff delay so the released record is
+        # immediately re-claimable for this state-machine assertion (backoff timing
+        # is covered by test_outbox_claim.test_transient_failure_schedules_future_backoff_retry).
+        publisher = EventPublisher(
+            failing_producer, outbox_store, max_retries=3, retry_base_seconds=0.0
+        )
         await publisher.start()
         event = SessionStartedEvent(user_id=uuid4(), session_number=1)
         await publisher.publish(event)
@@ -478,7 +487,11 @@ class TestEventPublisher:
             raise Exception("Connection failed")
         failing_producer = MockKafkaProducerAdapter()
         failing_producer.send = fail_send
-        publisher = EventPublisher(failing_producer, outbox_store, max_retries=2)
+        # retry_base_seconds=0 disables the backoff delay so the released record is
+        # immediately re-claimable across flushes for this terminal-FAILED assertion.
+        publisher = EventPublisher(
+            failing_producer, outbox_store, max_retries=2, retry_base_seconds=0.0
+        )
         await publisher.start()
         event = SessionStartedEvent(user_id=uuid4(), session_number=1)
         await publisher.publish(event)

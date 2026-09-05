@@ -99,7 +99,12 @@ class TestInMemoryOutboxStore:
         )
 
         await store.save(record)
-        await store.mark_published(record.id)
+        # mark_published is claim-conditional (P2-8): the record must be CLAIMED
+        # (PUBLISHING) — as the real flush flow does via get_pending — before it
+        # can be finalized to PUBLISHED.
+        await store.get_pending()
+        marked = await store.mark_published(record.id)
+        assert marked is True
         pending = await store.get_pending()
 
         assert len(pending) == 0

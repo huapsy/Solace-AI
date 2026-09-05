@@ -14,6 +14,7 @@ from solace_events.consumer import (
     ProcessingStatus,
     create_consumer,
 )
+from solace_events.publisher import InMemoryIdempotencyStore
 from solace_events.schemas import SessionStartedEvent
 
 
@@ -337,6 +338,84 @@ class TestEventConsumer:
         )
 
         assert len(dead_letters) == 1
+
+
+class TestConsumerIdempotency:
+    """P2-8: at-least-once redelivery must not double-fire the handler."""
+
+    @pytest.mark.asyncio
+    async def test_duplicate_event_id_fires_handler_once(self) -> None:
+        """SAME event_id delivered twice fires the side effect exactly once."""
+        fired = []
+
+        async def handler(event):
+            fired.append(event.metadata.event_id)
+
+        store = InMemoryIdempotencyStore()
+        consumer = EventConsumer(
+            MockKafkaConsumerAdapter(),
+            idempotency_store=store,
+            consumer_group="crisis-group",
+        )
+        consumer.register_handler("session.started", handler)
+
+        event = SessionStartedEvent(user_id=uuid4(), session_number=1)
+        payload = event.to_dict()
+
+        # First delivery — processed, handler fires.
+        r1 = await consumer._process_message("solace.sessions", 0, 1, payload)
+        # Redelivery of the SAME event (at-least-once) — must NOT fire again.
+        r2 = await consumer._process_message("solace.sessions", 0, 2, payload)
+
+        assert r1.status == ProcessingStatus.SUCCESS
+        assert r2.status == ProcessingStatus.SKIP
+        assert len(fired) == 1, "duplicate event double-fired the handler"
+
+    @pytest.mark.asyncio
+    async def test_distinct_event_ids_each_fire(self) -> None:
+        """A genuinely new event_id still fires the handler."""
+        fired = []
+
+        async def handler(event):
+            fired.append(event.metadata.event_id)
+
+        store = InMemoryIdempotencyStore()
+        consumer = EventConsumer(
+            MockKafkaConsumerAdapter(),
+            idempotency_store=store,
+            consumer_group="crisis-group",
+        )
+        consumer.register_handler("session.started", handler)
+
+        e1 = SessionStartedEvent(user_id=uuid4(), session_number=1)
+        e2 = SessionStartedEvent(user_id=uuid4(), session_number=2)
+
+        r1 = await consumer._process_message("solace.sessions", 0, 1, e1.to_dict())
+        r2 = await consumer._process_message("solace.sessions", 0, 2, e2.to_dict())
+
+        assert r1.status == ProcessingStatus.SUCCESS
+        assert r2.status == ProcessingStatus.SUCCESS
+        assert len(fired) == 2
+        assert set(fired) == {e1.metadata.event_id, e2.metadata.event_id}
+
+    @pytest.mark.asyncio
+    async def test_no_store_preserves_legacy_behavior(self) -> None:
+        """Without an idempotency store, every delivery fires (backward compat)."""
+        fired = []
+
+        async def handler(event):
+            fired.append(event.metadata.event_id)
+
+        consumer = EventConsumer(MockKafkaConsumerAdapter())
+        consumer.register_handler("session.started", handler)
+
+        event = SessionStartedEvent(user_id=uuid4(), session_number=1)
+        payload = event.to_dict()
+
+        await consumer._process_message("solace.sessions", 0, 1, payload)
+        await consumer._process_message("solace.sessions", 0, 2, payload)
+
+        assert len(fired) == 2
 
 
 class TestCreateConsumer:

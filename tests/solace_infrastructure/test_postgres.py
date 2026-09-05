@@ -208,6 +208,89 @@ class TestPostgresClient:
         assert health["status"] == "unhealthy"
 
 
+class TestPostgresClientRLSGUC:
+    """P2-6: PostgresClient.acquire must set the per-request RLS GUC on the borrowed
+    connection even when the use_connection_pool_manager feature flag is OFF and queries
+    route through this client (not ConnectionPoolManager). Mirrors
+    ConnectionPoolManager.acquire so RLS cannot be disabled by an infra flag.
+
+    Real-Postgres RLS enforcement is Stage-3-verified; here we assert the
+    GUC-SETTING behavior the enforcement depends on (set_config on the connection).
+    """
+
+    UID = "00000000-0000-4000-a000-000000000042"
+
+    @pytest.fixture
+    def mock_conn(self):
+        return AsyncMock()
+
+    @pytest.fixture
+    def mock_pool(self, mock_conn):
+        pool = MagicMock()
+        pool.acquire.return_value = MockAsyncContextManager(mock_conn)
+        return pool
+
+    @pytest.fixture
+    def client(self, mock_pool):
+        c = PostgresClient(PostgresSettings(password="test_password"))
+        c._pool = mock_pool
+        c._connected = True
+        return c
+
+    @staticmethod
+    def _guc_calls(mock_conn):
+        return [c.args for c in mock_conn.execute.await_args_list if "app.current_user_id" in c.args[0]]
+
+    @pytest.mark.asyncio
+    async def test_acquire_sets_guc_from_request_context(self, client, mock_conn):
+        from solace_common.request_context import (
+            reset_current_user_id,
+            set_current_user_id,
+        )
+
+        token = set_current_user_id(self.UID)
+        try:
+            async with client.acquire() as conn:
+                assert conn is mock_conn
+                set_calls = [
+                    a for a in self._guc_calls(mock_conn) if "$1" in a[0]
+                ]
+                assert set_calls, "acquire must SET app.current_user_id from request context"
+                # the bound value is the request user id, is_local=false (session-scoped)
+                assert set_calls[0][1] == self.UID
+                assert "false" in set_calls[0][0]
+        finally:
+            reset_current_user_id(token)
+
+    @pytest.mark.asyncio
+    async def test_acquire_resets_guc_on_release(self, client, mock_conn):
+        from solace_common.request_context import (
+            reset_current_user_id,
+            set_current_user_id,
+        )
+
+        token = set_current_user_id(self.UID)
+        try:
+            async with client.acquire():
+                pass
+        finally:
+            reset_current_user_id(token)
+        # after release, a reset (empty-string literal) set_config ran so the GUC does
+        # not leak to the next borrower of this pooled connection.
+        reset_calls = [a for a in self._guc_calls(mock_conn) if "''" in a[0]]
+        assert reset_calls, "acquire must RESET app.current_user_id on release"
+
+    @pytest.mark.asyncio
+    async def test_acquire_no_guc_when_context_unset(self, client, mock_conn):
+        """Unset context (service/background/anon) => no GUC set; RLS returns no user rows."""
+        from solace_common.request_context import reset_current_user_id
+
+        reset_current_user_id()  # ensure unset
+        async with client.acquire():
+            pass
+        assert self._guc_calls(mock_conn) == []
+
+
 class TestPostgresRepository:
     """Tests for PostgresRepository base class."""
 
