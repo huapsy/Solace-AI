@@ -1,0 +1,37 @@
+# Solace-AI Docker build-context excludes.
+# All service Dockerfiles build from the repository ROOT (`context: .`), so this single
+# .dockerignore governs EVERY image build.
+#
+# SECURITY (Phase C P2-15): never bake secrets into an image layer. The working-tree .env
+# holds live third-party API keys and must NOT enter any build context. .env.prod (prod
+# secrets) is injected at runtime via `env_file:`, never at build time, so it is excluded too.
+.env
+.env.*
+!.env.example
+
+# VCS / tooling
+.git
+.gitignore
+.github
+.claude
+
+# Python caches / build artifacts (never needed at build; keeps context small)
+**/__pycache__
+**/*.py[cod]
+**/*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+.coverage
+**/coverage.xml
+htmlcov
+
+# Virtualenvs / local dev
+.venv
+venv
+env
+node_modules
+
+# Logs / scratch
+*.log
+tests/logs

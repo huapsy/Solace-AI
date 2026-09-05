@@ -22,7 +22,7 @@ from infrastructure.api_gateway.routes import (
 )
 from infrastructure.api_gateway.rate_limiting import (
     RateLimitConfig, RateLimitPolicy, RateLimiter, RateLimitResult,
-    RateLimitWindow, RateLimitScope, RateLimitStore,
+    RateLimitWindow, RateLimitScope, RateLimitStore, RedisRateLimitStore,
     create_solace_rate_limiter,
 )
 from infrastructure.api_gateway.auth_plugin import (
@@ -38,7 +38,8 @@ from infrastructure.api_gateway.cors import (
 class TestKongConfig:
     def test_kong_settings_defaults(self):
         settings = KongSettings()
-        assert settings.admin_url == "http://localhost:8001"
+        # Hardened default: Kong admin SSL port over HTTPS (use HTTPS in production).
+        assert settings.admin_url == "https://localhost:8444"
         assert settings.timeout_seconds == 10.0
         assert settings.max_retries == 3
 
@@ -203,6 +204,28 @@ class TestRateLimiting:
         result = store.increment(policy, "user-123")
         assert result.allowed is False
 
+    def test_rate_limit_store_no_false_denial_after_idle(self, monkeypatch):
+        """A caller returning after >1 idle window must not be denied by a stale count.
+
+        Regression for the sliding-window reset carrying the previous window's count
+        regardless of idle time (api_gateway rate_limiting, flagged in Phase B G2).
+        """
+        import infrastructure.api_gateway.rate_limiting as rl
+
+        clock = {"t": 1000.0}
+        monkeypatch.setattr(rl.time, "time", lambda: clock["t"])
+
+        store = rl.RateLimitStore()
+        policy = rl.RateLimitPolicy(name="idle", limit=5, window=rl.RateLimitWindow.MINUTE)
+
+        for _ in range(5):
+            assert store.increment(policy, "u").allowed is True  # fill the window
+
+        clock["t"] += 3 * 60  # idle for 3 whole windows
+        result = store.increment(policy, "u")
+        assert result.allowed is True, "returning caller must start a fresh window, not inherit the old burst"
+        assert result.remaining == 4
+
     def test_rate_limiter_add_policy(self):
         limiter = RateLimiter()
         policy = RateLimitPolicy(name="test", limit=100, window=RateLimitWindow.MINUTE)
@@ -229,6 +252,75 @@ class TestRateLimiting:
         limiter = create_solace_rate_limiter()
         assert limiter.get_policy("global-standard") is not None
         assert limiter.get_policy("orchestrator-per-user") is not None
+
+    def test_create_solace_rate_limiter_redis_backed_when_client_provided(self):
+        """P2-10: a provided shared Redis client must produce a Redis-backed store so
+        limits are enforced across instances (not a per-process in-memory counter)."""
+        fake_redis = object()
+        limiter = create_solace_rate_limiter(redis_client=fake_redis)
+        assert isinstance(limiter._store, RedisRateLimitStore)
+        assert limiter._store._redis is fake_redis
+        # policies are still wired
+        assert limiter.get_policy("global-standard") is not None
+
+    def test_create_solace_rate_limiter_in_memory_for_dev_without_redis(self):
+        """P2-10: dev/test (redis=None, non-prod) keeps the in-memory store — no crash."""
+        limiter = create_solace_rate_limiter()
+        assert isinstance(limiter._store, RateLimitStore)
+        assert not isinstance(limiter._store, RedisRateLimitStore)
+
+    def test_create_solace_rate_limiter_fails_loud_in_prod_without_redis(self, monkeypatch):
+        """P2-10: in production, silently degrading to per-process in-memory is a security
+        hole — creation must FAIL LOUD when no shared Redis client is supplied."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        with pytest.raises(RuntimeError, match="[Rr]edis"):
+            create_solace_rate_limiter()
+
+    def test_create_solace_rate_limiter_prod_with_redis_ok(self, monkeypatch):
+        """P2-10: production WITH a shared Redis client is fine and Redis-backed."""
+        monkeypatch.setenv("ENVIRONMENT", "production")
+        limiter = create_solace_rate_limiter(redis_client=object())
+        assert isinstance(limiter._store, RedisRateLimitStore)
+
+    @pytest.mark.asyncio
+    async def test_redis_backed_limits_shared_across_instances(self):
+        """check_request_async on a Redis-backed store enforces ONE shared counter across
+        instances (the sync path silently used a per-process in-memory fallback — G2)."""
+
+        class _FakeAsyncRedis:
+            def __init__(self):
+                self.counts = {}
+                self.ttls = {}
+
+            async def eval(self, script, numkeys, *args):
+                key, window = args[0], int(args[1])
+                self.counts[key] = self.counts.get(key, 0) + 1
+                if self.counts[key] == 1:
+                    self.ttls[key] = window
+                return self.counts[key]
+
+            async def ttl(self, key):
+                return self.ttls.get(key, -1)
+
+        shared = _FakeAsyncRedis()
+
+        def make_instance():
+            limiter = RateLimiter(redis_client=shared)  # -> RedisRateLimitStore(shared)
+            limiter.add_policy(
+                RateLimitPolicy(name="svc", limit=2, window=RateLimitWindow.MINUTE,
+                                scope=RateLimitScope.CONSUMER, service_name="s")
+            )
+            return limiter
+
+        a, b = make_instance(), make_instance()
+        r1 = await a.check_request_async("s", None, "user1")
+        r2 = await b.check_request_async("s", None, "user1")  # different instance, same Redis
+        r3 = await a.check_request_async("s", None, "user1")
+        assert r1.allowed and r2.allowed
+        assert r3.allowed is False
+        assert r3.retry_after and r3.retry_after >= 1
+        # a different identifier has its own bucket
+        assert (await b.check_request_async("s", None, "user2")).allowed is True
 
 
 class TestJWTAuth:

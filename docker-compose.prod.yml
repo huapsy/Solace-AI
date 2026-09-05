@@ -20,16 +20,22 @@
 #     via the shared docker network, but the host no longer exposes them.
 #
 # Required env (via ``.env.prod`` on the VPS):
+#   ENVIRONMENT=production  REQUIRED — global gate for SSL/audit-HMAC/encryption fail-loud
+#                        layers (os.getenv('ENVIRONMENT')); this override ALSO derives the
+#                        memory/notification/analytics per-service gates from it (P1-8/P1-9).
+#   AUDIT_HMAC_KEY       32+ byte key; without it audit hashes fall back to non-HMAC (P1-8).
 #   DOMAIN               primary domain (e.g. solace-demo.example)
 #   CADDY_ADMIN_EMAIL    letsencrypt contact
 #   BASIC_AUTH_HASH      bcrypt hash for Grafana/Jaeger (use `caddy hash-password`)
 #   POSTGRES_PASSWORD    overrides the dev default
 #   ENCRYPTION_MASTER_KEY 32-byte key from secrets.token_bytes(32).hex()
 #   ENCRYPTION_SEARCH_HASH_SALT  32+ byte salt
-#   AUTH_SECRET_KEY      32+ byte JWT signing key
+#   JWT_SECRET_KEY       32+ byte JWT signing key (maps to AUTH_SECRET_KEY)
+#   WEAVIATE_API_KEY     REQUIRED — else Weaviate boots on the public dev default key (P2-16)
 #   GOOGLE_OAUTH_CLIENT_ID, GOOGLE_OAUTH_CLIENT_SECRET
 #   PORTKEY_API_KEY      https://portkey.ai dashboard
-#   ENVIRONMENT=production
+#   ORCHESTRATOR_TRUSTED_PROXY_HOPS=1  Caddy appends exactly one XFF hop (P2-12); defaults to 1
+#                        here so per-IP rate-limit keying is not collapsed behind the proxy.
 
 x-logging: &default-logging
   driver: json-file
@@ -42,8 +48,13 @@ x-restart: &default-restart
 
 # Required secrets — override the base file's dev-default fallbacks so a missing value in
 # .env.prod fails the deploy instead of silently shipping the dev JWT key to prod (REV-11).
+# P1-8: ENVIRONMENT and AUDIT_HMAC_KEY are guarded here too, so every app container gets the
+# global production gate (SSL/audit-HMAC/encryption fail-loud) and the deploy fails fast if
+# either is missing from .env.prod (they otherwise silently no-op into non-HMAC/plain hashing).
 x-app-secrets: &app-secrets
   AUTH_SECRET_KEY: ${JWT_SECRET_KEY:?JWT_SECRET_KEY must be set in .env.prod}
+  ENVIRONMENT: ${ENVIRONMENT:?ENVIRONMENT must be set to production in .env.prod}
+  AUDIT_HMAC_KEY: ${AUDIT_HMAC_KEY:?AUDIT_HMAC_KEY must be set in .env.prod}
 
 services:
   caddy:
@@ -78,6 +89,9 @@ services:
     env_file: .env.prod
     environment:
       <<: *app-secrets
+      # P2-12: Caddy appends exactly one X-Forwarded-For hop. With hops=0 the orchestrator
+      # keys every anonymous request on Caddy's internal IP (one shared rate-limit bucket).
+      ORCHESTRATOR_TRUSTED_PROXY_HOPS: "1"
     logging: *default-logging
     <<: *default-restart
     deploy:
@@ -118,6 +132,8 @@ services:
   diagnosis-service:
     ports: []
     env_file: .env.prod
+    environment:
+      <<: *app-secrets
     logging: *default-logging
     <<: *default-restart
     deploy:
@@ -128,6 +144,8 @@ services:
   therapy-service:
     ports: []
     env_file: .env.prod
+    environment:
+      <<: *app-secrets
     logging: *default-logging
     <<: *default-restart
     deploy:
@@ -138,6 +156,12 @@ services:
   memory-service:
     ports: []
     env_file: .env.prod
+    environment:
+      <<: *app-secrets
+      # P1-9: derive the memory runtime gate (MemoryServiceAppSettings.environment, bound from
+      # MEMORY_ENVIRONMENT) from the global ENVIRONMENT so a single ENVIRONMENT=production makes
+      # the production PHI-encryption / PHI-log-sanitizer guards reachable. :? fails fast.
+      MEMORY_ENVIRONMENT: ${ENVIRONMENT:?ENVIRONMENT must be set to production in .env.prod}
     logging: *default-logging
     <<: *default-restart
     deploy:
@@ -148,6 +172,8 @@ services:
   personality-service:
     ports: []
     env_file: .env.prod
+    environment:
+      <<: *app-secrets
     logging: *default-logging
     <<: *default-restart
     deploy:
@@ -159,18 +185,32 @@ services:
   notification-service:
     ports: []
     env_file: .env.prod
+    environment:
+      <<: *app-secrets
+      # P1-9: derive the notification runtime gate (ServiceConfig.env, bound from
+      # NOTIFICATION_SERVICE_ENV) from the global ENVIRONMENT so the crisis-consumer-required
+      # and PHI-log-sanitizer production guards actually fire. :? fails fast.
+      NOTIFICATION_SERVICE_ENV: ${ENVIRONMENT:?ENVIRONMENT must be set to production in .env.prod}
     logging: *default-logging
     <<: *default-restart
 
   analytics-service:
     ports: []
     env_file: .env.prod
+    environment:
+      <<: *app-secrets
+      # P1-9: derive the analytics runtime gate (ServiceConfig.env, bound from
+      # ANALYTICS_SERVICE_ENV) from the global ENVIRONMENT so docs/CORS lockdown and the
+      # PHI-log-sanitizer production guard actually fire. :? fails fast.
+      ANALYTICS_SERVICE_ENV: ${ENVIRONMENT:?ENVIRONMENT must be set to production in .env.prod}
     logging: *default-logging
     <<: *default-restart
 
   config-service:
     ports: []
     env_file: .env.prod
+    environment:
+      <<: *app-secrets
     logging: *default-logging
     <<: *default-restart
 
@@ -197,6 +237,13 @@ services:
 
   weaviate:
     ports: []
+    environment:
+      # P2-16: Weaviate holds PHI-derived embeddings. The base file falls back to the
+      # publicly-known dev key (solace-dev-key-change-in-production). Guard WEAVIATE_API_KEY
+      # with :? and re-declare the allowed key without the dev fallback so a missing/default
+      # key fails the prod deploy instead of booting with an anonymous-equivalent key.
+      WEAVIATE_API_KEY: ${WEAVIATE_API_KEY:?WEAVIATE_API_KEY must be set in .env.prod}
+      AUTHENTICATION_APIKEY_ALLOWED_KEYS: ${WEAVIATE_API_KEY:?WEAVIATE_API_KEY must be set in .env.prod}
     logging: *default-logging
     <<: *default-restart
     deploy:

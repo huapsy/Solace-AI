@@ -143,7 +143,13 @@ class RateLimitStore:
         if key not in self._counters or now - self._counters[key].window_start >= window_seconds:
             if key in self._counters:
                 prev = self._counters[key]
-                self._counters[key] = SlidingWindowCounter(key=key, window_seconds=window_seconds, limit=policy.limit, current_count=1, previous_count=prev.current_count, window_start=now)
+                # Only carry the previous window's count when the reset lands in the
+                # window IMMEDIATELY after it. After a longer idle the prior count is
+                # stale — carrying it would weight a long-gone burst into the new window
+                # and falsely deny a returning caller.
+                elapsed = now - prev.window_start
+                carried = prev.current_count if elapsed < 2 * window_seconds else 0
+                self._counters[key] = SlidingWindowCounter(key=key, window_seconds=window_seconds, limit=policy.limit, current_count=1, previous_count=carried, window_start=now)
             else:
                 self._counters[key] = SlidingWindowCounter(key=key, window_seconds=window_seconds, limit=policy.limit, current_count=1, previous_count=0, window_start=now)
         else:
@@ -292,6 +298,41 @@ class RateLimiter:
             return min(denied_results, key=lambda r: r.remaining)
         return min(results, key=lambda r: r.remaining)
 
+    def _select_policies(self, service_name: str | None, route_name: str | None) -> list[RateLimitPolicy]:
+        """Policies that apply to a (route, service) request, most-specific first + globals."""
+        policies: list[RateLimitPolicy] = []
+        if route_name and route_name in self._route_policies:
+            policies += [self._policies[n] for n in self._route_policies[route_name] if n in self._policies]
+        if service_name and service_name in self._service_policies:
+            policies += [self._policies[n] for n in self._service_policies[service_name] if n in self._policies]
+        policies += [p for p in self._policies.values() if p.scope == RateLimitScope.GLOBAL]
+        return [p for p in policies if p.enabled]
+
+    async def check_request_async(
+        self, service_name: str | None, route_name: str | None, identifier: str
+    ) -> RateLimitResult:
+        """Async counterpart to check_request that uses the store's atomic async path.
+
+        For a Redis-backed store this hits ``async_increment`` (atomic INCR+EXPIRE), so
+        limits are shared ACROSS instances — the whole point of the Redis store, which the
+        sync path silently bypassed via its in-memory fallback (G2 finding). Falls back to
+        the sync ``increment`` for in-memory stores.
+        """
+        policies = self._select_policies(service_name, route_name)
+        if not policies:
+            return RateLimitResult(
+                allowed=True, remaining=self._config.default_limit,
+                limit=self._config.default_limit, reset_at=datetime.now(timezone.utc),
+            )
+        results: list[RateLimitResult] = []
+        for policy in policies:
+            if hasattr(self._store, "async_increment"):
+                results.append(await self._store.async_increment(policy, identifier))
+            else:
+                results.append(self._store.increment(policy, identifier))
+        denied = [r for r in results if not r.allowed]
+        return min(denied or results, key=lambda r: r.remaining)
+
     def get_usage(self, policy_name: str, identifier: str) -> dict[str, Any]:
         policy = self._policies.get(policy_name)
         if not policy:
@@ -308,14 +349,38 @@ class RateLimiter:
         return True
 
 
-def create_solace_rate_limiter(config: RateLimitConfig | None = None) -> RateLimiter:
-    """Create pre-configured rate limiter for Solace-AI."""
-    limiter = RateLimiter(config)
+def create_solace_rate_limiter(
+    config: RateLimitConfig | None = None,
+    redis_client: Any | None = None,
+) -> RateLimiter:
+    """Create pre-configured rate limiter for Solace-AI.
+
+    P2-10: when a shared ``redis_client`` is supplied the limiter is Redis-backed
+    (``RedisRateLimitStore``), so limits are enforced across ALL instances via the
+    atomic async path. Without one, enforcement silently degrades to a per-process
+    in-memory counter — acceptable for dev/test but a security hole in production
+    (each replica gets its own budget). So in production (``ENVIRONMENT=production``)
+    a missing Redis client is a FAIL-LOUD error rather than a silent fallback.
+    """
+    import os
+
+    env = os.getenv("ENVIRONMENT", "development").lower()
+    if redis_client is None and env == "production":
+        raise RuntimeError(
+            "Rate limiter requires a shared Redis client in production "
+            "(ENVIRONMENT=production): multi-instance limits cannot be enforced with a "
+            "per-process in-memory store. Pass redis_client=<shared Redis> to "
+            "create_solace_rate_limiter()."
+        )
+
+    limiter = RateLimiter(config, redis_client=redis_client)
     limiter.add_policy(RateLimitPolicy(name="global-standard", limit=1000, window=RateLimitWindow.MINUTE, scope=RateLimitScope.GLOBAL, tags=["solace", "global"]))
     limiter.add_policy(RateLimitPolicy(name="orchestrator-per-user", limit=60, window=RateLimitWindow.MINUTE, scope=RateLimitScope.CONSUMER, service_name="orchestrator-service", tags=["solace", "orchestrator"]))
     limiter.add_policy(RateLimitPolicy(name="chat-per-user", limit=30, window=RateLimitWindow.MINUTE, scope=RateLimitScope.CONSUMER, route_name="chat-message", tags=["solace", "chat"]))
     limiter.add_policy(RateLimitPolicy(name="assessment-per-user", limit=10, window=RateLimitWindow.HOUR, scope=RateLimitScope.CONSUMER, service_name="diagnosis-service", tags=["solace", "assessment"]))
     limiter.add_policy(RateLimitPolicy(name="auth-per-ip", limit=20, window=RateLimitWindow.MINUTE, scope=RateLimitScope.IP, route_name="auth-login", tags=["solace", "auth"]))
     limiter.add_policy(RateLimitPolicy(name="admin-per-user", limit=100, window=RateLimitWindow.MINUTE, scope=RateLimitScope.CONSUMER, service_name="admin-service", tags=["solace", "admin"]))
-    logger.info("solace_rate_limiter_configured", policies=6)
+    logger.info(
+        "solace_rate_limiter_configured", policies=6, redis_backed=redis_client is not None
+    )
     return limiter

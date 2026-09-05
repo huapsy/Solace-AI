@@ -275,7 +275,11 @@ services:
       dockerfile: services/notification-service/Dockerfile
     container_name: solace-notification-service
     environment:
-      NOTIFICATION_SERVICE_ENV: development
+      # P1-9: runtime gate is ServiceConfig(env_prefix="NOTIFICATION_SERVICE_").env, so the
+      # binding var is NOTIFICATION_SERVICE_ENV. Made overridable so .env.prod/global
+      # ENVIRONMENT can lift it above the dev default (a bare literal here would win over
+      # env_file and pin the service to development in prod).
+      NOTIFICATION_SERVICE_ENV: ${NOTIFICATION_SERVICE_ENV:-development}
       NOTIFICATION_SERVICE_PORT: 8003
       EMAIL_ENABLED: "true"
       EMAIL_SMTP_HOST: ${SMTP_HOST:-mailhog}
@@ -337,7 +341,11 @@ services:
       dockerfile: services/memory_service/Dockerfile
     container_name: solace-memory-service
     environment:
-      MEMORY_SERVICE_ENV: development
+      # P1-9: the runtime gate is MemoryServiceAppSettings(env_prefix="MEMORY_").environment,
+      # which binds MEMORY_ENVIRONMENT. The previous MEMORY_SERVICE_ENV bound nothing, pinning
+      # settings.environment to the 'development' default in every environment (so the
+      # production PHI-encryption / PHI-log-sanitizer guards were permanently unreachable).
+      MEMORY_ENVIRONMENT: ${MEMORY_ENVIRONMENT:-development}
       MEMORY_SERVICE_PORT: 8005
       MEMORY_DB_HOST: postgres
       MEMORY_DB_PORT: 5432
@@ -473,7 +481,10 @@ services:
       dockerfile: services/analytics-service/Dockerfile
     container_name: solace-analytics-service
     environment:
-      ANALYTICS_SERVICE_ENV: development
+      # P1-9: runtime gate is ServiceConfig(env_prefix="ANALYTICS_SERVICE_").env, so the
+      # binding var is ANALYTICS_SERVICE_ENV. Made overridable so a bare literal does not win
+      # over env_file and pin the service to development in prod.
+      ANALYTICS_SERVICE_ENV: ${ANALYTICS_SERVICE_ENV:-development}
       ANALYTICS_SERVICE_PORT: 8009
       CONSUMER_KAFKA_ENABLED: "true"
       CONSUMER_KAFKA_BOOTSTRAP_SERVERS: kafka:9092

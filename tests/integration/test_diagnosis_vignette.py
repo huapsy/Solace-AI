@@ -97,7 +97,7 @@ class TestDiagnosisCrisisPhaseRouting:
 
         from services.diagnosis_service.src.schemas import DifferentialDTO
 
-        async def _fake_step4(hyps, challenge, phase, message, session=None):
+        async def _fake_step4(hyps, challenge, phase, message, session=None, working_symptoms=None, **kwargs):
             return {
                 "differential": DifferentialDTO(primary=None, alternatives=[]),
                 "next_question": None,

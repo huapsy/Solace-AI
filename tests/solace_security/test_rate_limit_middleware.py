@@ -107,6 +107,31 @@ def test_exempt_path_is_not_limited():
         assert client.get("/health").status_code == 200
 
 
+def test_liveness_probe_is_never_rate_limited():
+    """A rate-limited liveness probe causes false 'unhealthy' -> restart storms. /live
+    (like /health, /ready, /) must stay exempt even hammered far past the limit."""
+    app = FastAPI()
+    app.add_middleware(
+        RateLimitMiddleware,
+        limiter=_limiter(1),
+        service_name="test-svc",
+        principal_resolver=_by_user,
+    )
+
+    @app.get("/live", include_in_schema=False)
+    async def live():
+        return {"status": "alive"}
+
+    @app.get("/ready", include_in_schema=False)
+    async def ready():
+        return {"status": "ready"}
+
+    client = TestClient(app)
+    for _ in range(10):
+        assert client.get("/live").status_code == 200
+        assert client.get("/ready").status_code == 200
+
+
 def test_default_principal_ignores_spoofable_xff():
     # SECURITY: with no trusted proxy (default), X-Forwarded-For is IGNORED — a caller
     # rotating XFF must NOT mint fresh buckets. All requests key on the socket peer.
